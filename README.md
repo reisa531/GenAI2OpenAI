@@ -9,6 +9,21 @@
 
 GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的聊天完成接口，利用上海科技大学的 GenAI API 进行智能对话。项目通过封装 GenAI API，支持思维链、流式响应和普通响应，从而方便客户端集成与调用。该项目适合开发具有中文支持及本地化需求的智能聊天机器人应用。
 
+## 项目结构
+
+```text
+main.py                         Flask 入口、路由和上游流式编排
+genai_proxy/models.py           模型列表、别名解析和上游路由类型
+genai_proxy/tools.py            消息归一化和提示词式 Tool Calling
+genai_proxy/images.py           图片 URL、Data URL 和消息图片解析
+genai_proxy/upstream.py         OpenAI 响应结构和输入转换
+utility/auto_login/             上海科技大学 CAS 自动登录
+tools/                          模型测速和上下文长度测试工具
+docs/                           模型记录和问题登记
+```
+
+`main.py` 保留 HTTP 路由和请求编排；可复用的模型、消息、图片和协议转换逻辑放在 `genai_proxy/` 中，便于单独检查和测试。
+
 **OpenAI Compatible 功能对比**
 
 | 能力项                                    | OpenAI 官方接口 | 本项目实现情况 | 说明                                                       |
@@ -83,7 +98,7 @@ uv run main.py [--token <token>] [--account <student_id@password>] [--upload-tok
 | deepseek-chat     | ✅     | 未知   | 未测试             | 0.983s         | 19.62 tokens/s | 
 
 兼容层同时兼容历史请求名和底层模型名，详见[模型列表](docs/模型列表.md)。
-以上信息最后更新于 `2026-05-08`。
+以上信息最后更新于 `2026-05-08`。上游模型和额度会变化，表中的速度与上下文数据只代表记录时的实测结果。
 
 ### 测试模型上下文长度
 
@@ -130,6 +145,8 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 ```
 
 如果模型决定调用工具，非流式响应会返回 `finish_reason: "tool_calls"` 和 `message.tool_calls`。流式请求也会返回兼容的 `tool_calls` chunk，但为了可靠解析 JSON，带工具的流式请求会先在服务端收集完整上游输出后再发送结果。
+
+服务端会先收集上游 SSE，再解析完整 JSON。上游最后一个 SSE 事件可能同时包含最后一段文本和 `finish_reason`；服务端会先处理最后一段内容，再结束本轮响应，避免工具 JSON 的末尾被截掉。
 
 兼容性补充：
 
@@ -208,6 +225,32 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 ![图片说明](images/chrome.png)
 
 对于图片功能, 需要捕获`upload` API, 提取请求 header 中的 `token` ,然后通过 `--upload-token` 传入.
+
+## 常见问题
+
+### 工具调用结果被截断
+
+最近一次测试结果与验证范围见[工具调用测试记录](docs/工具调用测试.md)。
+
+先确认客户端发送的是 `tools` 和 `tool_choice`，并检查服务端日志中的上游 HTTP 状态。带工具的流式请求会在服务端聚合上游内容，因此客户端收到第一个 `tool_calls` chunk 前可能会等待一段时间。
+
+如果仍然出现截断，可以用不带工具的请求确认普通流式链路，再用 `stream: false` 检查模型是否能返回完整 JSON。上游 token 失效时，服务端会收到 `Token失效，请重新登录`，这不是工具解析错误。
+
+### Token 无效
+
+可以直接传入新的 token：
+
+```bash
+uv run main.py --token '<token>'
+```
+
+也可以使用自动登录：
+
+```bash
+uv run main.py --account '<学号>@<密码>'
+```
+
+不要把真实 token 或密码写进仓库、Issue、日志和示例文档。
 
 ## 开发与贡献指南
 
