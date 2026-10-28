@@ -65,10 +65,10 @@ def normalize_messages_for_genai(messages):
             continue
 
         tool_calls = message.get("tool_calls")
-        if role == "assistant" and tool_calls and not content:
+        if role == "assistant" and tool_calls:
             normalized_messages.append({
                 "role": "assistant",
-                "content": "已请求调用工具：\n" + json.dumps(tool_calls, ensure_ascii=False),
+                "content": (content + "\n" if content else "") + "已请求调用工具：\n" + json.dumps(tool_calls, ensure_ascii=False),
             })
             continue
 
@@ -170,42 +170,23 @@ def strip_json_code_fence(text):
 
 
 def extract_json_object(text):
-    """从文本中提取第一个完整 JSON 对象。"""
+    """从文本中提取第一个完整 JSON 对象或数组。"""
     stripped = strip_json_code_fence(text)
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
 
-    start = stripped.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(stripped)):
-        char = stripped[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(stripped[start:index + 1])
-                except json.JSONDecodeError:
-                    return None
+    # 从最外层容器开始解码，保留数组及尾随文字中的多个调用。
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\[{]", stripped):
+        try:
+            value, _ = decoder.raw_decode(stripped, match.start())
+            return value
+        except json.JSONDecodeError:
+            # 工具数组/对象不完整时，不能从内部抢救一个调用并执行。
+            if re.search(r'"(?:tool_calls|function|name)"\s*:', stripped[match.start():]):
+                return None
     return None
 
 
@@ -218,74 +199,73 @@ def normalize_tool_call_arguments(arguments):
     return json.dumps(arguments, ensure_ascii=False)
 
 
-def extract_tool_calls_from_xml(content):
-    """从 <tool_call>...</tool_call> 中提取工具调用（XML 兼容，JSON 仍为主）。"""
+def parse_tool_calls_from_content(content, tools=None, tool_choice=None):
+    """解析工具对象、数组和 XML；只返回已声明且参数为 JSON 对象的调用。"""
     if not content:
         return []
 
-    blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.DOTALL)
-    tool_calls = []
-    for block in blocks:
-        parsed = extract_json_object(block)
-        if not isinstance(parsed, dict):
-            continue
-
-        name = parsed.get("name")
-        if not name:
-            continue
-
-        arguments = parsed.get("arguments", {})
-        tool_calls.append({
-            "id": f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": normalize_tool_call_arguments(arguments),
-            },
-        })
-
-    return tool_calls
-
-
-def parse_tool_calls_from_content(content):
-    """解析提示词约定的工具调用 JSON，并转换为 OpenAI tool_calls 结构。"""
-    if not content:
-        return []
-
-    # 优先 JSON：兼容当前主路径。
-    parsed = extract_json_object(content)
-    raw_calls = None
-    if isinstance(parsed, dict):
-        raw_calls = parsed.get("tool_calls")
-        if raw_calls is None and parsed.get("name"):
-            raw_calls = [parsed]
-    elif "<tool_call>" in content:
-        # JSON 解析失败时回退 XML。
-        return extract_tool_calls_from_xml(content)
+    if "<tool_call>" in content:
+        blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.DOTALL)
+        if len(blocks) != content.count("<tool_call>"):
+            raise ValueError("Incomplete tool_call block")
+        raw_calls = []
+        for block in blocks:
+            parsed = extract_json_object(block)
+            if not isinstance(parsed, dict):
+                raise ValueError("Invalid tool_call JSON")
+            raw_calls.append(parsed)
+    else:
+        parsed = extract_json_object(content)
+        if isinstance(parsed, list):
+            # 普通答案也可能是 JSON 数组，只有调用形状才当作工具协议。
+            if not any(isinstance(item, dict) and ("name" in item or "function" in item) for item in parsed):
+                raw_calls = []
+            else:
+                raw_calls = parsed
+        elif isinstance(parsed, dict):
+            raw_calls = parsed.get("tool_calls")
+            if raw_calls is None and ("name" in parsed or "function" in parsed):
+                raw_calls = [parsed]
+            if raw_calls is None:
+                raw_calls = []
+        else:
+            raw_calls = []
+        if not raw_calls and re.search(r'"(?:tool_calls|function|name)"\s*:|<tool_call>', content):
+            raise ValueError("Invalid or incomplete tool call JSON")
 
     if not isinstance(raw_calls, list):
-        if "<tool_call>" in content:
-            return extract_tool_calls_from_xml(content)
-        return []
-
+        raise ValueError("tool_calls must be an array")
+    allowed_names = None if tools is None else {
+        tool.get("function", {}).get("name") for tool in tools if isinstance(tool, dict)
+    }
     tool_calls = []
     for raw_call in raw_calls:
         if not isinstance(raw_call, dict):
-            continue
-
+            raise ValueError("Each tool call must be an object")
         function = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else raw_call
         name = function.get("name")
-        if not name:
-            continue
-
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Tool call is missing a function name")
+        if allowed_names is not None and name not in allowed_names:
+            raise ValueError(f"Unknown tool: {name}")
         arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON arguments for tool: {name}") from exc
+        if not isinstance(arguments, dict):
+            raise ValueError(f"Tool arguments must be an object: {name}")
+        call_id = raw_call.get("id")
         tool_calls.append({
-            "id": raw_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "id": call_id if isinstance(call_id, str) and call_id else f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
-            "function": {
-                "name": name,
-                "arguments": normalize_tool_call_arguments(arguments),
-            },
+            "function": {"name": name, "arguments": normalize_tool_call_arguments(arguments)},
         })
 
+    choice = normalize_tool_choice(tool_choice)
+    if choice == "required" and not tool_calls:
+        raise ValueError("Upstream did not return the required tool call")
+    if isinstance(choice, dict) and (not tool_calls or any(call["function"]["name"] != choice["name"] for call in tool_calls)):
+        raise ValueError(f"Upstream did not call the selected tool: {choice['name']}")
     return tool_calls

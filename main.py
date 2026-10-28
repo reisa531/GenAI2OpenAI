@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from datetime import datetime
 
@@ -27,6 +28,7 @@ from genai_proxy.upstream import (
     build_response_input_messages,
     iter_sse_events,
 )
+from genai_proxy.streaming import iter_with_heartbeat
 from genai_proxy.images import (
     guess_filename_from_url,
     read_image_from_data_url,
@@ -206,6 +208,7 @@ GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
 GENAI_MODELS_URL = "https://genai.shanghaitech.edu.cn/htk/ai/aiModel/list"
 GENAI_UPLOAD_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/upload"
 GENAI_IMAGE_STATIC_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/static/"
+GENAI_STREAM_TIMEOUT = (10, 180)
 GENAI_HEADERS = {
     "Accept": "*/*, text/event-stream",
     "Cache-Control": "no-cache",
@@ -457,13 +460,14 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
         len(messages) if isinstance(messages, list) else 0,
     )
 
+    response = None
     try:
         response = requests.post(
             GENAI_URL,
             headers=build_genai_headers(access_token),
             json=genai_data,
             stream=True,
-            timeout=60
+            timeout=GENAI_STREAM_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -474,7 +478,7 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
             }
             return
 
-        for event in iter_sse_events(response.iter_lines(), extract_delta_from_genai):
+        for event in iter_sse_events(response.iter_lines(chunk_size=1), extract_delta_from_genai):
             if event["type"] == "delta":
                 logger.debug("Upstream SSE delta received")
             yield event
@@ -486,6 +490,9 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
             "type": "error",
             "error": str(e),
         }
+    finally:
+        if response is not None:
+            response.close()
 
 
 def stream_chat_completions_response(messages, model, max_tokens, access_token=None, image_payload=None):
@@ -506,6 +513,7 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
     for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
         if event["type"] == "error":
             yield f"data: {json.dumps({'error': event['error']})}\n\n"
+            yield "data: [DONE]\n\n"
             return
 
         if event["type"] == "delta":
@@ -542,7 +550,7 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
                     {
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop"
+                        "finish_reason": event.get("finish_reason", "stop")
                     }
                 ]
             }
@@ -551,7 +559,7 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
             return
 
 
-def stream_tool_calls_response(model, content, tool_calls):
+def stream_tool_calls_response(model, content, tool_calls, finish_reason="stop"):
     """将完整解析出的工具调用转换为 Chat Completions SSE。"""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
@@ -600,7 +608,6 @@ def stream_tool_calls_response(model, content, tool_calls):
             ]
         }
         yield f"data: {json.dumps(content_chunk)}\n\n"
-        finish_reason = "stop"
 
     final_response = {
         "id": response_id,
@@ -617,6 +624,44 @@ def stream_tool_calls_response(model, content, tool_calls):
     }
     yield f"data: {json.dumps(final_response)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def stream_buffered_tool_response(messages, model, max_tokens, access_token=None, image_payload=None, tools=None, tool_choice=None):
+    """聚合工具 JSON 时发送心跳，避免客户端在静默等待时断开。"""
+    started_at = time.monotonic()
+    content_parts = []
+    finish_reason = "stop"
+    events = iter_with_heartbeat(
+        stream_genai_events(messages, model, max_tokens, access_token, image_payload)
+    )
+    try:
+        for event in events:
+            if event is None:
+                yield ": keep-alive\n\n"
+            elif event["type"] == "error":
+                raise RuntimeError(event["error"])
+            elif event["type"] == "delta" and event.get("content"):
+                content_parts.append(event["content"])
+            elif event["type"] == "done":
+                finish_reason = event.get("finish_reason", "stop")
+                break
+        content = "".join(content_parts)
+        if not content.strip():
+            raise RuntimeError("GenAI upstream returned an empty response; please retry")
+        if finish_reason != "stop":
+            raise RuntimeError(f"GenAI tool response was not completed: {finish_reason}")
+        tool_calls = parse_tool_calls_from_content(content, tools, tool_choice)
+        logger.info(
+            "Tool response collected: model=%s elapsed=%.1fs content_chars=%s tool_call_count=%s",
+            model, time.monotonic() - started_at, len(content), len(tool_calls),
+        )
+        yield from stream_tool_calls_response(model, content, tool_calls)
+    except Exception as exc:
+        logger.warning("Tool stream failed: model=%s error=%s", model, exc)
+        yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}})}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        events.close()
 
 
 def collect_genai_response(messages, model, max_tokens, access_token=None, image_payload=None):
@@ -637,6 +682,7 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
     content_parts = []
     reasoning_parts = []
     upstream_model = None
+    finish_reason = "stop"
 
     for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
         if event["type"] == "error":
@@ -648,12 +694,14 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
             if event.get("content"):
                 content_parts.append(event["content"])
         if event["type"] == "done":
+            finish_reason = event.get("finish_reason", "stop")
             break
 
     return {
         "content": "".join(content_parts),
         "reasoning_content": "".join(reasoning_parts),
         "upstream_model": upstream_model,
+        "finish_reason": finish_reason,
     }
 
 
@@ -727,14 +775,16 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
                 yield f"data: {json.dumps(content_event)}\n\n"
 
         if event["type"] == "done":
+            incomplete = event.get("finish_reason", "stop") != "stop"
             completed_event = {
-                "type": "response.completed",
+                "type": "response.incomplete" if incomplete else "response.completed",
                 "response": {
                     "id": response_id,
                     "object": "response",
                     "created_at": created,
-                    "status": "completed",
+                    "status": "incomplete" if incomplete else "completed",
                     "model": model,
+                    "incomplete_details": {"reason": event["finish_reason"]} if incomplete else None,
                 }
             }
             yield f"data: {json.dumps(completed_event)}\n\n"
@@ -778,15 +828,20 @@ def chat_completions():
 
         if stream:
             if tools_enabled:
-                collected = collect_genai_response(upstream_messages, model, max_tokens, access_token, image_payload)
-                tool_calls = parse_tool_calls_from_content(collected["content"])
+                logger.info(
+                    "Collecting tool response: model=%s message_count=%s tool_count=%s",
+                    model,
+                    len(upstream_messages),
+                    len(tools),
+                )
                 return Response(
-                    stream_with_context(stream_tool_calls_response(model, collected["content"], tool_calls)),
+                    stream_with_context(stream_buffered_tool_response(upstream_messages, model, max_tokens, access_token, image_payload, tools, tool_choice)),
                     mimetype='text/event-stream',
                     headers={
                         'Cache-Control': 'no-cache',
                         'Connection': 'keep-alive',
                         'Content-Type': 'text/event-stream',
+                        'X-Accel-Buffering': 'no',
                     }
                 )
 
@@ -802,12 +857,15 @@ def chat_completions():
 
         # 非流式模式先完整收集，再一次性组装 OpenAI 响应体。
         collected = collect_genai_response(upstream_messages, model, max_tokens, access_token, image_payload)
-        tool_calls = parse_tool_calls_from_content(collected["content"]) if tools_enabled else []
+        if tools_enabled and collected["finish_reason"] != "stop":
+            raise RuntimeError(f"GenAI tool response was not completed: {collected['finish_reason']}")
+        tool_calls = parse_tool_calls_from_content(collected["content"], tools, tool_choice) if tools_enabled else []
         response = build_chat_completion_payload(
             model,
             collected["content"],
             collected["reasoning_content"],
             tool_calls,
+            collected["finish_reason"],
         )
         return jsonify(response)
     
@@ -851,6 +909,7 @@ def responses():
 
         # 非流式返回时，将 reasoning 和 message 组装到 output 数组中。
         collected = collect_genai_response(messages, model, max_output_tokens, access_token)
+        incomplete = collected["finish_reason"] != "stop"
         response_id = f"resp_{uuid.uuid4().hex}"
         output = []
         if collected["reasoning_content"]:
@@ -880,7 +939,8 @@ def responses():
             "id": response_id,
             "object": "response",
             "created_at": int(datetime.now().timestamp()),
-            "status": "completed",
+            "status": "incomplete" if incomplete else "completed",
+            "incomplete_details": {"reason": collected["finish_reason"]} if incomplete else None,
             "model": model,
             "output": output,
             "output_text": collected["content"],

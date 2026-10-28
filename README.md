@@ -148,7 +148,7 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 }
 ```
 
-如果模型决定调用工具，非流式响应会返回 `finish_reason: "tool_calls"` 和 `message.tool_calls`。流式请求也会返回兼容的 `tool_calls` chunk，但为了可靠解析 JSON，带工具的流式请求会先在服务端收集完整上游输出后再发送结果。
+如果模型决定调用工具，非流式响应会返回 `finish_reason: "tool_calls"` 和 `message.tool_calls`。流式请求也会返回兼容的 `tool_calls` chunk，但为了可靠解析 JSON，带工具的流式请求会先在服务端收集完整上游输出后再发送结果。连接会立即建立，等待期间每 5 秒发送 SSE 心跳；上游返回空内容时会发送明确的错误。心跳不会显示为模型正文，实际工具调用仍需等待生成完成。
 
 服务端会先收集上游 SSE，再解析完整 JSON。上游最后一个 SSE 事件可能同时包含最后一段文本和 `finish_reason`；服务端会先处理最后一段内容，再结束本轮响应，避免工具 JSON 的末尾被截掉。
 
@@ -156,7 +156,9 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 
 - 解析优先级为 **JSON 优先**；
 - 同时兼容 XML 标签形式的工具调用块：`<tool_call>{"name":"...","arguments":{...}}</tool_call>`；
-- 当模型输出多个 `<tool_call>...</tool_call>` 块时，会按顺序解析为多个 `tool_calls`。
+- 支持标准 `tool_calls` 对象、顶层调用数组、单个嵌套 `function` 对象和尾随文字；多个 `<tool_call>...</tool_call>` 块会按顺序解析。
+- 工具名称必须来自本次请求，参数必须是合法 JSON 对象。不完整的工具协议会明确报错；正常的最终文本回复仍受支持。
+- 普通文本响应保留上游 `length` 等结束原因。异常 EOF 不会作为正常完成；工具响应被长度限制中断时不会执行其调用。
 
 ### 图片输入（仅 GPT 模型）
 
@@ -238,7 +240,7 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 
 对于 DSH 这类带较长系统提示和多个工具的客户端，兼容层会在完整上下文末尾附加工具输出格式约定。如果只收到“我先查看项目”之类的行动预告就结束，需区分模型未生成工具调用与 JSON 被截断；两者的排查方向不同。
 
-先确认客户端发送的是 `tools` 和 `tool_choice`，并检查服务端日志中的上游 HTTP 状态。带工具的流式请求会在服务端聚合上游内容，因此客户端收到第一个 `tool_calls` chunk 前可能会等待一段时间。
+先确认客户端发送的是 `tools` 和 `tool_choice`，并检查服务端日志中的上游 HTTP 状态。带工具的流式请求会在服务端聚合上游内容，因此客户端收到第一个 `tool_calls` chunk 前可能会等待一段时间，期间会持续收到 SSE 心跳。
 
 如果仍然出现截断，可以用不带工具的请求确认普通流式链路，再用 `stream: false` 检查模型是否能返回完整 JSON。上游 token 失效时，服务端会收到 `Token失效，请重新登录`，这不是工具解析错误。
 

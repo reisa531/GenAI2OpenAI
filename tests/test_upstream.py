@@ -6,6 +6,17 @@ from genai_proxy.upstream import iter_sse_events
 
 
 class UpstreamSseTests(unittest.TestCase):
+    def test_eof_is_not_reported_as_normal_completion(self):
+        events = list(iter_sse_events(['data: {"choices":[{"delta":{"content":"partial"}}]}']))
+        self.assertEqual(events[-1]["type"], "error")
+
+    def test_length_and_done_marker_are_preserved(self):
+        events = list(iter_sse_events(['data: {"choices":[{"delta":{"content":"last"},"finish_reason":"length"}]}']))
+        self.assertEqual(events[0]["content"], "last")
+        self.assertEqual(events[-1]["finish_reason"], "length")
+        events = list(iter_sse_events([': keep-alive', 'data: [DONE]']))
+        self.assertEqual(events[-1]["finish_reason"], "stop")
+
     def test_tool_protocol_follows_client_context_without_mutating_it(self):
         messages = [
             {"role": "system", "content": "Use native tools to inspect files."},

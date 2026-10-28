@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 
 
-def build_chat_completion_payload(model, content, reasoning_content=None, tool_calls=None):
+def build_chat_completion_payload(model, content, reasoning_content=None, tool_calls=None, finish_reason="stop"):
     """构建非流式 Chat Completions 响应。"""
     message = {
         "role": "assistant",
@@ -25,7 +25,7 @@ def build_chat_completion_payload(model, content, reasoning_content=None, tool_c
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": "tool_calls" if tool_calls else "stop"
+                "finish_reason": "tool_calls" if tool_calls else finish_reason
             }
         ],
         "usage": {
@@ -66,10 +66,16 @@ def iter_sse_events(lines, delta_parser=extract_delta_from_genai):
             continue
 
         line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+        if line_str.startswith(":") or line_str.startswith("event:"):
+            continue
         if line_str.startswith("data:"):
             line_str = line_str[5:].strip()
         if not line_str:
             continue
+        if line_str == "[DONE]":
+            finished = True
+            yield {"type": "done", "upstream_model": None, "finish_reason": "stop"}
+            break
 
         try:
             payload = json.loads(line_str)
@@ -101,11 +107,14 @@ def iter_sse_events(lines, delta_parser=extract_delta_from_genai):
         choices = payload.get("choices") or []
         if choices and choices[0].get("finish_reason") is not None:
             finished = True
-            yield {"type": "done", "upstream_model": payload.get("model")}
+            yield {
+                "type": "done", "upstream_model": payload.get("model"),
+                "finish_reason": choices[0]["finish_reason"],
+            }
             break
 
     if not finished:
-        yield {"type": "done", "upstream_model": None}
+        yield {"type": "error", "error": "GenAI upstream stream ended without a completion marker"}
 
 
 def build_response_input_messages(input_value):
