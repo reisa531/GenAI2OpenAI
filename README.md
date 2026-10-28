@@ -157,7 +157,7 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 - 解析优先级为 **JSON 优先**；
 - 同时兼容 XML 标签形式的工具调用块：`<tool_call>{"name":"...","arguments":{...}}</tool_call>`；
 - 支持标准 `tool_calls` 对象、顶层调用数组、单个嵌套 `function` 对象和尾随文字；多个 `<tool_call>...</tool_call>` 块会按顺序解析。
-- 工具名称必须来自本次请求，参数必须是合法 JSON 对象。不完整的工具协议会明确报错；正常的最终文本回复仍受支持。
+- 工具名称必须来自本次请求，参数必须是合法 JSON 对象。上游正常结束且每个调用及参数完整时，允许补齐缺少的外层数组或包装对象闭合；参数、字符串或调用对象残缺时仍明确报错。正文中的 `name` 字段和普通 JSON 数据不会仅因字段名被当作工具调用。
 - 普通文本响应保留上游 `length` 等结束原因。异常 EOF 不会作为正常完成；工具响应被长度限制中断时不会执行其调用。
 
 ### 图片输入（仅 GPT 模型）

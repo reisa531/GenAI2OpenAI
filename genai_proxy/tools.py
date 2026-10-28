@@ -1,6 +1,7 @@
 """Message normalization and prompt-based tool-call compatibility."""
 
 import json
+import logging
 import re
 import uuid
 
@@ -169,24 +170,85 @@ def strip_json_code_fence(text):
     return stripped
 
 
+def is_tool_call_object(value):
+    """普通 JSON 的 name 字段不代表工具调用。"""
+    if not isinstance(value, dict):
+        return False
+    function = value.get("function")
+    return (
+        isinstance(function, dict) and "name" in function
+        or "name" in value and "arguments" in value
+    )
+
+
+def looks_like_tool_container(text):
+    """只检查看似 JSON 的容器，不用正文里的字段名猜测工具协议。"""
+    if not re.match(r'^\s*[\[{]\s*(?:[\[{\"]|$)', text):
+        return False
+    return bool(re.search(
+        r'"tool_calls"\s*:|"function"\s*:\s*\{|"name"\s*:\s*"[^"\n]+"\s*,\s*"arguments"\s*:',
+        text,
+    ))
+
+
+def repair_tool_wrapper(text):
+    """只补齐完整调用外缺少的数组/包装对象闭合，不补参数或字符串。"""
+    stack = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            if not stack or stack.pop() != ("[" if char == "]" else "{"):
+                return None
+    if in_string or stack not in (["["], ["{"], ["{", "["]):
+        return None
+    suffix = "".join("]" if char == "[" else "}" for char in reversed(stack))
+    try:
+        parsed = json.loads(text + suffix)
+    except json.JSONDecodeError:
+        return None
+    calls = parsed.get("tool_calls") if isinstance(parsed, dict) else parsed
+    if not isinstance(calls, list) or not calls or not all(is_tool_call_object(call) for call in calls):
+        return None
+    # 调用对象和参数必须在原输出中闭合；只允许其外部包装缺少闭合。
+    if isinstance(parsed, dict) and set(parsed) != {"tool_calls"}:
+        return None
+    logging.getLogger("genai-proxy").warning(
+        "Repaired missing outer tool wrapper: closing_chars=%s", len(suffix),
+    )
+    return parsed
+
+
 def extract_json_object(text):
-    """从文本中提取第一个完整 JSON 对象或数组。"""
+    """从文本中提取完整容器；仅修复完整工具调用的外层闭合。"""
     stripped = strip_json_code_fence(text)
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
-
-    # 从最外层容器开始解码，保留数组及尾随文字中的多个调用。
     decoder = json.JSONDecoder()
     for match in re.finditer(r"[\[{]", stripped):
+        candidate = stripped[match.start():]
         try:
             value, _ = decoder.raw_decode(stripped, match.start())
             return value
         except json.JSONDecodeError:
-            # 工具数组/对象不完整时，不能从内部抢救一个调用并执行。
-            if re.search(r'"(?:tool_calls|function|name)"\s*:', stripped[match.start():]):
-                return None
+            if looks_like_tool_container(candidate):
+                repaired = repair_tool_wrapper(candidate)
+                if repaired is not None:
+                    return repaired
+                raise ValueError("Invalid or incomplete tool call JSON")
     return None
 
 
@@ -218,20 +280,18 @@ def parse_tool_calls_from_content(content, tools=None, tool_choice=None):
         parsed = extract_json_object(content)
         if isinstance(parsed, list):
             # 普通答案也可能是 JSON 数组，只有调用形状才当作工具协议。
-            if not any(isinstance(item, dict) and ("name" in item or "function" in item) for item in parsed):
+            if not any(is_tool_call_object(item) for item in parsed):
                 raw_calls = []
             else:
                 raw_calls = parsed
         elif isinstance(parsed, dict):
             raw_calls = parsed.get("tool_calls")
-            if raw_calls is None and ("name" in parsed or "function" in parsed):
+            if raw_calls is None and is_tool_call_object(parsed):
                 raw_calls = [parsed]
             if raw_calls is None:
                 raw_calls = []
         else:
             raw_calls = []
-        if not raw_calls and re.search(r'"(?:tool_calls|function|name)"\s*:|<tool_call>', content):
-            raise ValueError("Invalid or incomplete tool call JSON")
 
     if not isinstance(raw_calls, list):
         raise ValueError("tool_calls must be an array")

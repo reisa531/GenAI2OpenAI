@@ -630,7 +630,7 @@ def stream_buffered_tool_response(messages, model, max_tokens, access_token=None
     """聚合工具 JSON 时发送心跳，避免客户端在静默等待时断开。"""
     started_at = time.monotonic()
     content_parts = []
-    finish_reason = "stop"
+    finish_reason = None
     events = iter_with_heartbeat(
         stream_genai_events(messages, model, max_tokens, access_token, image_payload)
     )
@@ -657,7 +657,10 @@ def stream_buffered_tool_response(messages, model, max_tokens, access_token=None
         )
         yield from stream_tool_calls_response(model, content, tool_calls)
     except Exception as exc:
-        logger.warning("Tool stream failed: model=%s error=%s", model, exc)
+        logger.warning(
+            "Tool stream failed: model=%s content_chars=%s finish_reason=%s error=%s",
+            model, sum(map(len, content_parts)), finish_reason, exc,
+        )
         yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}})}\n\n"
         yield "data: [DONE]\n\n"
     finally:

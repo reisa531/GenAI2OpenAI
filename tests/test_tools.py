@@ -35,7 +35,6 @@ class ToolParsingTests(unittest.TestCase):
             '[ ' + json.dumps(self.call) + ', {"function":',
             '[ {"name":"read_file","arguments":{}},',
             '<tool_call>{"name":"read_file","arguments":{}}',
-            '{"tool_calls":' + json.dumps([self.call])[:-1],
             json.dumps({"tool_calls": "bad"}),
             json.dumps({"name": "not_declared", "arguments": {}}),
             json.dumps({"name": "read_file", "arguments": '{"path":'}),
@@ -46,6 +45,34 @@ class ToolParsingTests(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
                     parse_tool_calls_from_content(text, self.tools)
+
+    def test_only_missing_outer_wrapper_closures_are_repaired(self):
+        wrapped = json.dumps({"tool_calls": [self.call]})
+        array = json.dumps([self.call])
+        for text in [wrapped[:-1], wrapped[:-2], array[:-1]]:
+            with self.subTest(text=text):
+                calls = parse_tool_calls_from_content(text, self.tools)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]['id'], self.call['id'])
+        # 不能补齐调用对象或参数、字符串、逗号后的缺失值。
+        for text in [wrapped[:-3], wrapped[:-2] + ',',
+                     wrapped[:-1] + ',"other":[',
+                     '{"tool_calls":[{"name":"read_file","arguments":{"filePath":"abc',
+                     '{"tool_calls":[{"name":"read_file","arguments":{"filePath":"abc"',
+                     '[{"name":"read_file","arguments":{"filePath":"abc"}']:
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    parse_tool_calls_from_content(text, self.tools)
+
+    def test_normal_explanations_and_json_data_are_not_tool_protocol(self):
+        for text in ['已完成，字段为 `"name": "demo"`。',
+                     '```json\n{"name":"demo","version":"1.0"}\n```',
+                     '检查结果：{"ok":true}\n字段示例包含 "name": "read_file"。',
+                     '{"tool_calls":[]}',
+                     '{"function":"documentation","description":"API 示例"}',
+                     '[{"name":"demo","version":"1.0"}]']:
+            with self.subTest(text=text):
+                self.assertEqual(parse_tool_calls_from_content(text, self.tools), [])
 
     def test_required_choice_fails_explicitly_but_auto_allows_final_text(self):
         self.assertEqual(parse_tool_calls_from_content('完成。', self.tools), [])

@@ -111,6 +111,28 @@ class ToolStreamTests(unittest.TestCase):
                 self.assertEqual(actual['id'], call['id'])
                 self.assertEqual(json.loads(actual['function']['arguments']), json.loads(call['function']['arguments']))
 
+    def test_complete_call_with_missing_wrapper_through_routes(self):
+        # 对应真实上下文重放：调用及嵌套参数均完整，只缺外层 ]}。
+        body = '{"tool_calls":[{"name":"read_file","arguments":{"filePath":"a.py"}}'
+        for stream in (False, True):
+            events = [{"type": "delta", "content": body}, {"type": "done", "finish_reason": "stop"}]
+            with patch.object(self.server, "stream_genai_events", return_value=iter(events)):
+                response = self.server.app.test_client().post('/v1/chat/completions', json={
+                    "model": "deepseek-pro", "stream": stream,
+                    "messages": [{"role": "user", "content": "读取文件"}],
+                    "tools": [{"type": "function", "function": {"name": "read_file"}}],
+                })
+                self.assertEqual(response.status_code, 200)
+                if stream:
+                    text = response.get_data(as_text=True)
+                    self.assertIn('"finish_reason": "tool_calls"', text)
+                    self.assertNotIn('upstream_error', text)
+                else:
+                    choice = response.get_json()['choices'][0]
+                    self.assertEqual(choice['finish_reason'], 'tool_calls')
+                    args = json.loads(choice['message']['tool_calls'][0]['function']['arguments'])
+                    self.assertEqual(args, {'filePath': 'a.py'})
+
     def test_empty_and_failed_upstream_are_explicit_errors(self):
         for events in ([{"type": "done"}], [{"type": "error", "error": "upstream unavailable"}]):
             chunks = self.chunks(events)
