@@ -141,6 +141,7 @@ def build_tool_calling_messages(messages, tools, tool_choice):
         "兼容格式：也允许输出 <tool_call>{\"name\":\"工具名\",\"arguments\":{}}</tool_call>；若并行调用可连续输出多个 <tool_call>...</tool_call>。",
         "arguments 必须是符合工具 JSON Schema 的对象。",
         "如果不需要调用工具，则正常回答用户，不要输出上述 JSON。",
+        "如果需要通过工具查看文件或执行操作，本轮必须输出工具调用，不能只描述接下来要做什么。",
         f"tool_choice: {json.dumps(normalized_choice, ensure_ascii=False)}",
         "可用工具：",
         json.dumps(tools, ensure_ascii=False),
@@ -151,10 +152,9 @@ def build_tool_calling_messages(messages, tools, tool_choice):
     elif isinstance(normalized_choice, dict):
         tool_prompt.append(f"本次请求必须调用工具 {normalized_choice['name']}。")
 
-    return [
-        {"role": "system", "content": "\n".join(tool_prompt)},
-        *messages,
-    ]
+    # 客户端可能已有很长的 system prompt；将上游输出格式约定放在完整
+    # 上下文之后，避免模型只输出行动预告就结束本轮，而不输出工具 JSON。
+    return [*messages, {"role": "system", "content": "\n".join(tool_prompt)}]
 
 
 def strip_json_code_fence(text):

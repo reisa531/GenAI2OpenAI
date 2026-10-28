@@ -36,7 +36,7 @@ docs/                           模型记录和问题登记
 | Tool Calling（`tools/tool_choice`）       | ✅ 原生         | ✅ 提示词兼容  | 上游无原生工具调用，本项目做 JSON 约定与本地解析           |
 | 旧版函数调用（`functions/function_call`） | 已逐步废弃      | ✅ 兼容        | 自动转换为 `tools/tool_choice` 语义                        |
 | 图片输入（Vision）                        | ✅              | ✅（GPT 模型） | 服务端自动上传图片并注入 `imageUrl/width/height`           |
-| 模型列表接口（`GET /v1/models`）          | ✅              | ✅             | 返回本项目映射后的可用模型列表                             |
+| 模型列表接口（`GET /v1/models`）          | ✅              | ✅             | 实时拉取上游列表，返回上游 `aiType` 作为模型 ID             |
 | 认证头兼容（Bearer/API Key）              | ✅              | ✅             | 支持 `Authorization`、`X-Access-Token`、`api-key` 等       |
 
 ### Agent Tool 生态测试
@@ -74,10 +74,14 @@ uv run main.py [--token <token>] [--account <student_id@password>] [--upload-tok
 - 支持流式（stream）及非流式响应，方便高效地获取 AI 回复。
 - `POST /v1/chat/completions` 支持基于提示词工程和 JSON 解析的 OpenAI `tools`/`tool_choice` 兼容工具调用，也兼容旧版 `functions`/`function_call` 入参。
 - `POST /v1/chat/completions` 支持图片输入（服务端自动上传到 GenAI 图片服务后再发起对话），当前**仅 GPT 系列模型可用**。
-- 提供 `/v1/models` 接口列出可用模型，如 `deepseek-pro`、`deepseek-chat`、`gpt-5.5`、`glm-5.1` 等。
+- `/v1/models` 每次请求都会拉取上游模型列表，客户端可据此选择模型；列表不会混入已下线的静态模型。
 - 内置 `/health` 健康检查接口，用于服务状态监测。
 
 ### 支持模型
+
+当前模型请以 `GET /v1/models` 为准。该接口沿用对话接口的认证方式：未启用 `--account` 时，请求级 token 优先，未提供则使用启动 token；`--account` 模式使用服务端 token。返回的 `id` 是上游 `aiType`，可直接填入对话请求的 `model`。上游拉取失败返回 HTTP 502，不回退到旧列表。列表包含上游发布的不同类型模型，不代表本项目已实现所有模型对应的功能。
+
+以下表格保留历史测速和上下文测试数据，不代表当前在线模型：
 
 | 模型 id           | 可用性 | 思维链 | 实测上下文长度     | first_token_delay | 输出速度       |
 | ----------------- | ------ | ------ | ------------------ | -------------- | -------------- |
@@ -231,6 +235,8 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 ### 工具调用结果被截断
 
 最近一次测试结果与验证范围见[工具调用测试记录](docs/工具调用测试.md)。
+
+对于 DSH 这类带较长系统提示和多个工具的客户端，兼容层会在完整上下文末尾附加工具输出格式约定。如果只收到“我先查看项目”之类的行动预告就结束，需区分模型未生成工具调用与 JSON 被截断；两者的排查方向不同。
 
 先确认客户端发送的是 `tools` 和 `tool_choice`，并检查服务端日志中的上游 HTTP 状态。带工具的流式请求会在服务端聚合上游内容，因此客户端收到第一个 `tool_calls` chunk 前可能会等待一段时间。
 

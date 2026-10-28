@@ -1,11 +1,26 @@
 import unittest
 import json
 
-from genai_proxy.tools import parse_tool_calls_from_content
+from genai_proxy.tools import build_tool_calling_messages, parse_tool_calls_from_content
 from genai_proxy.upstream import iter_sse_events
 
 
 class UpstreamSseTests(unittest.TestCase):
+    def test_tool_protocol_follows_client_context_without_mutating_it(self):
+        messages = [
+            {"role": "system", "content": "Use native tools to inspect files."},
+            {"role": "user", "content": "Inspect this project."},
+        ]
+        tools = [{"type": "function", "function": {"name": "glob"}}]
+
+        result = build_tool_calling_messages(messages, tools, "auto")
+
+        self.assertEqual(result[:-1], messages)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(result[-1]["role"], "system")
+        self.assertIn('"tool_calls"', result[-1]["content"])
+        self.assertIn('"name": "glob"', result[-1]["content"])
+
     def test_last_delta_is_kept_when_finish_reason_is_present(self):
         fragments = ['{"tool_calls":[', '{"name":"weather","arguments":{}}]}']
         lines = [

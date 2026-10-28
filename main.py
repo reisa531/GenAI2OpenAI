@@ -17,6 +17,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "utility", "auto_login")
 from cas_login import LoginError, login_genai
 from genai_proxy.models import (
     MODEL_SPECS,
+    build_remote_model_list,
     resolve_model,
     is_gpt_model,
 )
@@ -268,7 +269,10 @@ def fetch_remote_models(access_token=None):
     payload = response.json()
     if not payload.get("success"):
         raise RuntimeError(f"Failed to fetch remote models: {payload}")
-    return payload.get("result", {}).get("records", [])
+    records = (payload.get("result") or {}).get("records")
+    if not isinstance(records, list):
+        raise RuntimeError("Invalid remote model list: missing records array")
+    return records
 
 
 def log_new_remote_models(access_token=None):
@@ -888,21 +892,17 @@ def responses():
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
-    """返回当前对外暴露的模型列表。
+    """使用当前请求凭据拉取上游模型列表。
 
     Returns:
         Response: OpenAI `/v1/models` 兼容 JSON 响应。
     """
-    models = []
-    for spec in MODEL_SPECS:
-        models.append({
-            "id": spec["public_id"],
-            "object": "model",
-            "owned_by": "genai",
-            "permission": []
-        })
-    
-    return jsonify({"object": "list", "data": models})
+    try:
+        records = fetch_remote_models(get_request_access_token())
+        return jsonify(build_remote_model_list(records))
+    except Exception as exc:
+        logger.exception("Failed to fetch remote model list")
+        return jsonify({"error": str(exc)}), 502
 
 @app.route('/health', methods=['GET'])
 def health_check():

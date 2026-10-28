@@ -114,6 +114,26 @@ def build_model_alias_lookup():
 MODEL_ALIAS_LOOKUP = build_model_alias_lookup()
 
 
+def build_remote_model_list(records):
+    """将上游模型记录转换为 OpenAI 列表，使用可直接请求的 aiType。"""
+    models = []
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        model_id = record.get("aiType")
+        if not isinstance(model_id, str) or not model_id.strip() or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append({
+            "id": model_id,
+            "object": "model",
+            "owned_by": "genai",
+            "permission": [],
+        })
+    return {"object": "list", "data": models}
+
+
 def resolve_model(model_name):
     """解析模型名称到上游请求参数。
 
