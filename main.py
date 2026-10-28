@@ -27,6 +27,7 @@ from genai_proxy.upstream import (
     extract_delta_from_genai,
     build_response_input_messages,
     iter_sse_events,
+    ToolCallAccumulator,
 )
 from genai_proxy.streaming import iter_with_heartbeat
 from genai_proxy.images import (
@@ -416,7 +417,7 @@ def prepare_image_payload(messages, model, access_token=None):
     return image_payload
 
 
-def stream_genai_events(messages, model, max_tokens, access_token=None, image_payload=None):
+def _stream_genai_attempt(messages, model, max_tokens, access_token=None, image_payload=None, request_id=None, attempt=1):
     """调用 GenAI 流式接口并产出统一事件流。
 
     该函数是整个协议转换的底层入口，负责：
@@ -461,6 +462,26 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
     )
 
     response = None
+    started_at = time.monotonic()
+    stats = {"events": 0, "content_chars": 0, "reasoning_chars": 0,
+             "native_fragments": 0, "delta_fields": {}, "message_fields": {}, "finish_reason": None}
+
+    def trace_delta(payload):
+        stats["events"] += 1
+        choice = (payload.get("choices") or [{}])[0]
+        for source, key in (("delta", "delta_fields"), ("message", "message_fields")):
+            fields = choice.get(source)
+            if isinstance(fields, dict):
+                for name in fields:
+                    stats[key][name] = stats[key].get(name, 0) + 1
+        stats["finish_reason"] = choice.get("finish_reason") or stats["finish_reason"]
+        delta = extract_delta_from_genai(payload)
+        for field, key in (("content", "content_chars"), ("reasoning", "reasoning_chars")):
+            if isinstance(delta.get(field), str):
+                stats[key] += len(delta[field])
+        stats["native_fragments"] += len(delta.get("tool_calls") or [])
+        return delta
+
     try:
         response = requests.post(
             GENAI_URL,
@@ -478,9 +499,12 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
             }
             return
 
-        for event in iter_sse_events(response.iter_lines(chunk_size=1), extract_delta_from_genai):
+        for event in iter_sse_events(response.iter_lines(chunk_size=1), trace_delta):
             if event["type"] == "delta":
                 logger.debug("Upstream SSE delta received")
+            if event["type"] == "done":
+                stats["completion_marker"] = True
+                stats["finish_reason"] = event.get("finish_reason")
             yield event
 
     except Exception as e:
@@ -493,6 +517,57 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
     finally:
         if response is not None:
             response.close()
+        logger.info(
+            "Upstream summary: request_id=%s attempt=%s model=%s elapsed=%.2fs stats=%s",
+            request_id, attempt, model, time.monotonic() - started_at, json.dumps(stats),
+        )
+
+
+def stream_genai_events(messages, model, max_tokens, access_token=None, image_payload=None):
+    """仅对正常结束的空生成重试一次；发布正文或调用后不再重试。"""
+    request_id = uuid.uuid4().hex[:12]
+    for attempt in (1, 2):
+        pending = []
+        published = False
+        retry = False
+        events = _stream_genai_attempt(
+            messages, model, max_tokens, access_token, image_payload, request_id, attempt,
+        )
+        try:
+            for event in events:
+                if event["type"] == "error":
+                    yield event
+                    return
+                if event["type"] == "delta":
+                    has_output = bool((event.get("content") or "").strip() or event.get("tool_calls"))
+                    if not published and not has_output:
+                        pending.append(event)
+                        continue
+                    if not published:
+                        yield from pending
+                        pending.clear()
+                        published = True
+                    yield event
+                elif event["type"] == "done":
+                    if not published and event.get("finish_reason", "stop") == "stop":
+                        if attempt == 1:
+                            logger.warning("Retrying empty upstream generation: request_id=%s", request_id)
+                            retry = True
+                            break
+                        yield {"type": "error", "error": "GenAI upstream returned an empty response after one retry"}
+                        return
+                    yield from pending
+                    yield event
+                    return
+                else:
+                    yield event
+        finally:
+            close = getattr(events, "close", None)
+            if close:
+                close()
+        if not retry:
+            yield {"type": "error", "error": "GenAI upstream stream ended without a completion marker"}
+            return
 
 
 def stream_chat_completions_response(messages, model, max_tokens, access_token=None, image_payload=None):
@@ -511,6 +586,8 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
     created = int(datetime.now().timestamp())
 
     for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
+        if event["type"] == "delta" and event.get("tool_calls"):
+            event = {"type": "error", "error": "Upstream returned native tool calls without enabled tools"}
         if event["type"] == "error":
             yield f"data: {json.dumps({'error': event['error']})}\n\n"
             yield "data: [DONE]\n\n"
@@ -630,6 +707,7 @@ def stream_buffered_tool_response(messages, model, max_tokens, access_token=None
     """聚合工具 JSON 时发送心跳，避免客户端在静默等待时断开。"""
     started_at = time.monotonic()
     content_parts = []
+    native_calls = ToolCallAccumulator()
     finish_reason = None
     events = iter_with_heartbeat(
         stream_genai_events(messages, model, max_tokens, access_token, image_payload)
@@ -640,17 +718,24 @@ def stream_buffered_tool_response(messages, model, max_tokens, access_token=None
                 yield ": keep-alive\n\n"
             elif event["type"] == "error":
                 raise RuntimeError(event["error"])
-            elif event["type"] == "delta" and event.get("content"):
-                content_parts.append(event["content"])
+            elif event["type"] == "delta":
+                if event.get("content"):
+                    content_parts.append(event["content"])
+                native_calls.add(event.get("tool_calls"))
             elif event["type"] == "done":
                 finish_reason = event.get("finish_reason", "stop")
                 break
         content = "".join(content_parts)
-        if not content.strip():
+        raw_calls = native_calls.result()
+        if not content.strip() and not raw_calls:
             raise RuntimeError("GenAI upstream returned an empty response; please retry")
-        if finish_reason != "stop":
+        if finish_reason not in ("stop", "tool_calls", "function_call"):
             raise RuntimeError(f"GenAI tool response was not completed: {finish_reason}")
-        tool_calls = parse_tool_calls_from_content(content, tools, tool_choice)
+        tool_calls = parse_tool_calls_from_content(
+            json.dumps({"tool_calls": raw_calls}) if raw_calls else content, tools, tool_choice,
+        )
+        if finish_reason in ("tool_calls", "function_call") and not tool_calls:
+            raise RuntimeError("GenAI upstream ended with tool_calls but returned no valid call")
         logger.info(
             "Tool response collected: model=%s elapsed=%.1fs content_chars=%s tool_call_count=%s",
             model, time.monotonic() - started_at, len(content), len(tool_calls),
@@ -684,6 +769,7 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
     """
     content_parts = []
     reasoning_parts = []
+    native_calls = ToolCallAccumulator()
     upstream_model = None
     finish_reason = "stop"
 
@@ -691,6 +777,7 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
         if event["type"] == "error":
             raise RuntimeError(event["error"])
         if event["type"] == "delta":
+            native_calls.add(event.get("tool_calls"))
             upstream_model = event.get("upstream_model") or upstream_model
             if event.get("reasoning"):
                 reasoning_parts.append(event["reasoning"])
@@ -705,6 +792,7 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
         "reasoning_content": "".join(reasoning_parts),
         "upstream_model": upstream_model,
         "finish_reason": finish_reason,
+        "tool_calls": native_calls.result(),
     }
 
 
@@ -738,6 +826,8 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
     yield f"data: {json.dumps(created_event)}\n\n"
 
     for event in stream_genai_events(messages, model, max_tokens, access_token):
+        if event["type"] == "delta" and event.get("tool_calls"):
+            event = {"type": "error", "error": "Native tool calls require Chat Completions with enabled tools"}
         if event["type"] == "error":
             error_event = {
                 "type": "response.failed",
@@ -860,9 +950,14 @@ def chat_completions():
 
         # 非流式模式先完整收集，再一次性组装 OpenAI 响应体。
         collected = collect_genai_response(upstream_messages, model, max_tokens, access_token, image_payload)
-        if tools_enabled and collected["finish_reason"] != "stop":
+        if collected["tool_calls"] and not tools_enabled:
+            raise RuntimeError("Upstream returned native tool calls without enabled tools")
+        if tools_enabled and collected["finish_reason"] not in ("stop", "tool_calls", "function_call"):
             raise RuntimeError(f"GenAI tool response was not completed: {collected['finish_reason']}")
-        tool_calls = parse_tool_calls_from_content(collected["content"], tools, tool_choice) if tools_enabled else []
+        tool_content = json.dumps({"tool_calls": collected["tool_calls"]}) if collected["tool_calls"] else collected["content"]
+        tool_calls = parse_tool_calls_from_content(tool_content, tools, tool_choice) if tools_enabled else []
+        if tools_enabled and collected["finish_reason"] in ("tool_calls", "function_call") and not tool_calls:
+            raise RuntimeError("GenAI upstream ended with tool_calls but returned no valid call")
         response = build_chat_completion_payload(
             model,
             collected["content"],
@@ -912,6 +1007,8 @@ def responses():
 
         # 非流式返回时，将 reasoning 和 message 组装到 output 数组中。
         collected = collect_genai_response(messages, model, max_output_tokens, access_token)
+        if collected["tool_calls"]:
+            raise RuntimeError("Native tool calls require Chat Completions with enabled tools")
         incomplete = collected["finish_reason"] != "stop"
         response_id = f"resp_{uuid.uuid4().hex}"
         output = []

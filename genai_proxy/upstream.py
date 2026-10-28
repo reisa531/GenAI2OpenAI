@@ -48,10 +48,15 @@ def extract_delta_from_genai(response_data):
     """
     try:
         if "choices" in response_data and len(response_data["choices"]) > 0:
-            delta = response_data["choices"][0].get("delta", {})
+            choice = response_data["choices"][0]
+            delta = choice.get("delta") or choice.get("message") or {}
+            calls = delta.get("tool_calls")
+            if not calls and delta.get("function_call"):
+                calls = [{"index": 0, "type": "function", "function": delta["function_call"]}]
             return {
-                "reasoning": delta.get("reasoning"),
+                "reasoning": delta.get("reasoning") or delta.get("reasoning_content"),
                 "content": delta.get("content"),
+                "tool_calls": calls,
             }
     except (KeyError, IndexError, TypeError):
         pass
@@ -96,12 +101,13 @@ def iter_sse_events(lines, delta_parser=extract_delta_from_genai):
             yield {"type": "meta", "other": payload["other"]}
 
         delta = delta_parser(payload)
-        if delta.get("reasoning") is not None or delta.get("content") is not None:
+        if delta.get("reasoning") is not None or delta.get("content") is not None or delta.get("tool_calls"):
             yield {
                 "type": "delta",
                 "upstream_model": payload.get("model"),
                 "reasoning": delta.get("reasoning"),
                 "content": delta.get("content"),
+                "tool_calls": delta.get("tool_calls"),
             }
 
         choices = payload.get("choices") or []
@@ -115,6 +121,35 @@ def iter_sse_events(lines, delta_parser=extract_delta_from_genai):
 
     if not finished:
         yield {"type": "error", "error": "GenAI upstream stream ended without a completion marker"}
+
+
+class ToolCallAccumulator:
+    """按 index 聚合原生工具增量，参数在完整收集后统一验证。"""
+
+    def __init__(self):
+        self.calls = {}
+
+    def add(self, fragments):
+        for position, fragment in enumerate(fragments or []):
+            index = fragment.get("index", position)
+            call = self.calls.setdefault(index, {
+                "id": None, "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if fragment.get("id"):
+                call["id"] = fragment["id"]
+            function = fragment.get("function") or {}
+            for key in ("name", "arguments"):
+                value = function.get(key)
+                if value is not None:
+                    if key == "arguments" and isinstance(value, dict):
+                        value = json.dumps(value, ensure_ascii=False)
+                    if not isinstance(value, str):
+                        raise ValueError(f"Invalid native tool {key}")
+                    call["function"][key] += value
+
+    def result(self):
+        return [self.calls[index] for index in sorted(self.calls)]
 
 
 def build_response_input_messages(input_value):

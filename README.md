@@ -159,6 +159,8 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 - 支持标准 `tool_calls` 对象、顶层调用数组、单个嵌套 `function` 对象和尾随文字；多个 `<tool_call>...</tool_call>` 块会按顺序解析。
 - 工具名称必须来自本次请求，参数必须是合法 JSON 对象。上游正常结束且每个调用及参数完整时，允许补齐缺少的外层数组或包装对象闭合；参数、字符串或调用对象残缺时仍明确报错。正文中的 `name` 字段和普通 JSON 数据不会仅因字段名被当作工具调用。
 - 普通文本响应保留上游 `length` 等结束原因。异常 EOF 不会作为正常完成；工具响应被长度限制中断时不会执行其调用。
+- 上游正常结束但没有正文或工具调用时，最多重新请求一次生成；两次均为空则明确报错。重试沿用原历史，不执行客户端工具。已有正文/调用、网络错误、长度限制或异常 EOF 不会触发此重试。
+- Chat Completions 工具请求也支持上游原生 `tool_calls` / `function_call` 增量，以及 `choice.message` 形式的完整结果，统一聚合后校验。`reasoning_content` 与 `reasoning` 均会识别；仅有思考而无最终输出时也受上述一次重试限制。
 
 ### 图片输入（仅 GPT 模型）
 

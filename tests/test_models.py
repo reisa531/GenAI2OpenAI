@@ -14,6 +14,9 @@ class RemoteModelTests(unittest.TestCase):
             cls.server = importlib.import_module('main')
 
     def setUp(self):
+        token = patch.dict(self.server.GENAI_HEADERS, {'X-Access-Token': 'startup-test-token'})
+        token.start()
+        self.addCleanup(token.stop)
         self.client = self.server.app.test_client()
 
     def test_upstream_ids_are_preserved_and_invalid_records_skipped(self):
